@@ -74,6 +74,14 @@ struct ConstantEncryption : public ModulePass {
   bool flag;
   bool dispatchonce;
   std::unordered_set<GlobalVariable *> handled_gvs;
+  // Helper: detect once-style runtime helpers we must not tamper with.
+  static bool isOnceFunctionName(StringRef Name) {
+#if LLVM_VERSION_MAJOR >= 18
+    return Name.contains("dispatch_once") || Name.contains("swift_once");
+#else
+    return Name.contains("dispatch_once") || Name.contains("swift_once");
+#endif
+  }
   ConstantEncryption(bool flag) : ModulePass(ID) { this->flag = flag; }
   ConstantEncryption() : ModulePass(ID) { this->flag = true; }
   bool shouldEncryptConstant(Instruction *I) {
@@ -110,15 +118,20 @@ struct ConstantEncryption : public ModulePass {
                        !isa<Function>(calledFunction)) ||
                       CS.getIntrinsicID() != Intrinsic::not_intrinsic)
                     continue;
-                  if (calledFunction->getName() == "_dispatch_once" ||
-                      calledFunction->getName() == "dispatch_once")
+                  if (isOnceFunctionName(calledFunction->getName()))
                     return false;
                 }
       }
     return true;
   }
   bool runOnModule(Module &M) override {
-    dispatchonce = M.getFunction("dispatch_once");
+    dispatchonce = false;
+    for (Function &Fn : M) {
+      if (isOnceFunctionName(Fn.getName())) {
+        dispatchonce = true;
+        break;
+      }
+    }
     for (Function &F : M)
       if (toObfuscate(flag, &F, "constenc") && !F.isPresplitCoroutine()) {
         errs() << "Running ConstantEncryption On " << F.getName() << "\n";
@@ -169,8 +182,7 @@ struct ConstantEncryption : public ModulePass {
              !isa<Function>(calledFunction)) ||
             CS.getIntrinsicID() != Intrinsic::not_intrinsic)
           continue;
-        if (calledFunction->getName() == "_dispatch_once" ||
-            calledFunction->getName() == "dispatch_once") {
+        if (isOnceFunctionName(calledFunction->getName())) {
           Value *onceToken = U->getOperand(0);
           if (dyn_cast_or_null<GlobalVariable>(
                   onceToken->stripPointerCasts()) == GV)
@@ -191,8 +203,7 @@ struct ConstantEncryption : public ModulePass {
                      !isa<Function>(calledFunction)) ||
                     CS.getIntrinsicID() != Intrinsic::not_intrinsic)
                   continue;
-                if (calledFunction->getName() == "_dispatch_once" ||
-                    calledFunction->getName() == "dispatch_once")
+                if (isOnceFunctionName(calledFunction->getName()))
                   return true;
               }
     }
