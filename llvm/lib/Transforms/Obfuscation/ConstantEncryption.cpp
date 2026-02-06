@@ -82,6 +82,21 @@ struct ConstantEncryption : public ModulePass {
     return Name.contains("dispatch_once") || Name.contains("swift_once");
 #endif
   }
+  // Swift runtime heavily relies on immutable constants and specific layouts;
+  // obfuscating those tends to crash (e.g. RxSwift DisposeBag). Guard them out.
+  static bool isSwiftFunction(const Function &F) {
+    CallingConv::ID CC = F.getCallingConv();
+    if (CC == CallingConv::Swift)
+      return true;
+    StringRef N = F.getName();
+#if LLVM_VERSION_MAJOR >= 18
+    return N.starts_with("$s") || N.starts_with("$S") ||
+           N.starts_with("_$s") || N.starts_with("_$S");
+#else
+    return N.startswith("$s") || N.startswith("$S") ||
+           N.startswith("_$s") || N.startswith("_$S");
+#endif
+  }
   ConstantEncryption(bool flag) : ModulePass(ID) { this->flag = flag; }
   ConstantEncryption() : ModulePass(ID) { this->flag = true; }
   bool shouldEncryptConstant(Instruction *I) {
@@ -132,7 +147,9 @@ struct ConstantEncryption : public ModulePass {
         break;
       }
     }
-    for (Function &F : M)
+    for (Function &F : M) {
+      if (isSwiftFunction(F))
+        continue; // Swift runtime/layout is fragile; skip constant encryption.
       if (toObfuscate(flag, &F, "constenc") && !F.isPresplitCoroutine()) {
         errs() << "Running ConstantEncryption On " << F.getName() << "\n";
         FixFunctionConstantExpr(&F);
@@ -165,6 +182,7 @@ struct ConstantEncryption : public ModulePass {
           times--;
         }
       }
+    }
     return true;
   }
 
@@ -302,6 +320,58 @@ struct ConstantEncryption : public ModulePass {
   void HandleConstantIntInitializerGV(GlobalVariable *GVPtr) {
     if (!(flag || AreUsersInOneFunction(GVPtr)) || isDispatchOnceToken(GVPtr) ||
         isAtomicLoaded(GVPtr))
+      return;
+
+    // Skip thread-local variables
+    if (GVPtr->isThreadLocal())
+      return;
+
+    // Skip constant global variables (may be in read-only sections)
+    if (GVPtr->isConstant())
+      return;
+
+    // Skip Swift metadata and Objective-C runtime related sections
+    if (GVPtr->hasSection()) {
+      StringRef Section = GVPtr->getSection();
+#if LLVM_VERSION_MAJOR >= 18
+      if (Section.starts_with("__swift") ||
+          Section.starts_with("__objc") ||
+          Section.starts_with("__TEXT,__swift") ||
+          Section.starts_with("__DATA,__objc") ||
+          Section.contains("__metadata") ||
+          Section.contains("__typeref") ||
+          Section.contains("__reflstr"))
+#else
+      if (Section.startswith("__swift") ||
+          Section.startswith("__objc") ||
+          Section.startswith("__TEXT,__swift") ||
+          Section.startswith("__DATA,__objc") ||
+          Section.contains("__metadata") ||
+          Section.contains("__typeref") ||
+          Section.contains("__reflstr"))
+#endif
+        return;
+    }
+
+    // Skip variables with Swift or Objective-C metadata naming patterns
+    StringRef Name = GVPtr->getName();
+#if LLVM_VERSION_MAJOR >= 18
+    if (Name.starts_with("_swift_") ||
+        Name.starts_with("__swift_") ||
+        Name.starts_with("OBJC_") ||
+        Name.starts_with("_OBJC_") ||
+        Name.contains("metadata") ||
+        Name.contains("type_ref") ||
+        Name.contains("protocol_conformance"))
+#else
+    if (Name.startswith("_swift_") ||
+        Name.startswith("__swift_") ||
+        Name.startswith("OBJC_") ||
+        Name.startswith("_OBJC_") ||
+        Name.contains("metadata") ||
+        Name.contains("type_ref") ||
+        Name.contains("protocol_conformance"))
+#endif
       return;
     // Prepare Types and Keys
     std::pair<ConstantInt *, ConstantInt *> keyandnew;
