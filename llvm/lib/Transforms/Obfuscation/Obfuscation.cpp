@@ -59,6 +59,38 @@ static cl::opt<bool>
     EnableIndirectBranching("enable-indibran", cl::init(false), cl::NotHidden,
                             cl::desc("Enable Indirect Branching."));
 static cl::opt<bool>
+    EnableFunctionNameObfuscation("enable-fnnameobf", cl::init(false),
+                                  cl::NotHidden,
+                                  cl::desc("Enable Function Name Obfuscation."));
+static cl::opt<bool>
+    EnableClassNameObfuscation("enable-clsobf", cl::init(false),
+                               cl::NotHidden,
+                               cl::desc("Enable Class Name Obfuscation."));
+static cl::opt<bool>
+    EnableObjCSelectorObfuscation("enable-objcselobf", cl::init(false),
+                                  cl::NotHidden,
+                                  cl::desc("Enable ObjC Selector Obfuscation."));
+static cl::opt<bool>
+    EnableObjCPropertyObfuscation("enable-objcpropobf", cl::init(false),
+                                  cl::NotHidden,
+                                  cl::desc("Enable ObjC Property Obfuscation."));
+static cl::opt<bool>
+    EnableSwiftSymbolObfuscation("enable-swiftsymobf", cl::init(false),
+                                 cl::NotHidden,
+                                 cl::desc("Enable Swift Symbol Obfuscation."));
+static cl::opt<bool>
+    EnableMetadataStringObfuscation("enable-metastrobf", cl::init(false),
+                                    cl::NotHidden,
+                                    cl::desc("Enable Metadata String Obfuscation."));
+static cl::opt<bool>
+    EnableSymbolVisibilityObfuscation("enable-symvisobf", cl::init(false),
+                                      cl::NotHidden,
+                                      cl::desc("Enable Symbol Visibility Obfuscation."));
+static cl::opt<bool>
+    EnableDependencyDiversification("enable-depdivobf", cl::init(false),
+                                    cl::NotHidden,
+                                    cl::desc("Enable Dependency Diversification."));
+static cl::opt<bool>
     EnableFunctionWrapper("enable-funcwra", cl::init(false), cl::NotHidden,
                           cl::desc("Enable Function Wrapper."));
 // End Obfuscator Options
@@ -81,6 +113,30 @@ static void LoadEnv(void) {
   }
   if (getenv("INDIBRAN")) {
     EnableIndirectBranching = true;
+  }
+  if (getenv("FNNAMEOBF")) {
+    EnableFunctionNameObfuscation = true;
+  }
+  if (getenv("CLSOBF")) {
+    EnableClassNameObfuscation = true;
+  }
+  if (getenv("OBJCSELOBF")) {
+    EnableObjCSelectorObfuscation = true;
+  }
+  if (getenv("OBJCPROPOBF")) {
+    EnableObjCPropertyObfuscation = true;
+  }
+  if (getenv("SWIFTSYMOBF")) {
+    EnableSwiftSymbolObfuscation = true;
+  }
+  if (getenv("METASTROBF")) {
+    EnableMetadataStringObfuscation = true;
+  }
+  if (getenv("SYMVISOBF")) {
+    EnableSymbolVisibilityObfuscation = true;
+  }
+  if (getenv("DEPDIVOBF")) {
+    EnableDependencyDiversification = true;
   }
   if (getenv("FUNCWRA")) {
     EnableFunctionWrapper = true; // Broken
@@ -146,11 +202,6 @@ struct Obfuscation : public ModulePass {
     MP = createAntiDebuggingPass(EnableAntiDebugging);
     MP->runOnModule(M);
     delete MP;
-    // Now Encrypt Strings
-    MP = createStringEncryptionPass(EnableAllObfuscation ||
-                                    EnableStringEncryption);
-    MP->runOnModule(M);
-    delete MP;
     // Now perform Function-Level Obfuscation
     for (Function &F : M)
       if (!F.isDeclaration()) {
@@ -182,6 +233,46 @@ struct Obfuscation : public ModulePass {
     delete P;
     MP = createFunctionWrapperPass(EnableAllObfuscation ||
                                    EnableFunctionWrapper);
+    MP->runOnModule(M);
+    delete MP;
+    // Encrypt Strings AFTER all function-level passes (SplitBasicBlock,
+    // BogusControlFlow, Flattening, Substitution, ConstantEncryption,
+    // IndirectBranch, FunctionWrapper) to prevent them from modifying the
+    // string decryption blocks, which would corrupt XOR decryption logic.
+    MP = createStringEncryptionPass(EnableAllObfuscation ||
+                                    EnableStringEncryption);
+    MP->runOnModule(M);
+    delete MP;
+    MP = createFunctionNameObfuscationPass(EnableAllObfuscation ||
+                                           EnableFunctionNameObfuscation);
+    MP->runOnModule(M);
+    delete MP;
+    MP = createClassNameObfuscationPass(EnableAllObfuscation ||
+                                        EnableClassNameObfuscation);
+    MP->runOnModule(M);
+    delete MP;
+    MP = createObjCSelectorObfuscationPass(EnableAllObfuscation ||
+                                           EnableObjCSelectorObfuscation);
+    MP->runOnModule(M);
+    delete MP;
+    MP = createObjCPropertyObfuscationPass(EnableAllObfuscation ||
+                                           EnableObjCPropertyObfuscation);
+    MP->runOnModule(M);
+    delete MP;
+    MP = createSwiftSymbolObfuscationPass(EnableAllObfuscation ||
+                                          EnableSwiftSymbolObfuscation);
+    MP->runOnModule(M);
+    delete MP;
+    MP = createMetadataStringObfuscationPass(EnableAllObfuscation ||
+                                             EnableMetadataStringObfuscation);
+    MP->runOnModule(M);
+    delete MP;
+    MP = createSymbolVisibilityObfuscationPass(EnableAllObfuscation ||
+                                               EnableSymbolVisibilityObfuscation);
+    MP->runOnModule(M);
+    delete MP;
+    MP = createDependencyDiversificationPass(
+        EnableAllObfuscation || EnableDependencyDiversification);
     MP->runOnModule(M);
     delete MP;
     // Cleanup Flags
@@ -237,6 +328,14 @@ INITIALIZE_PASS_DEPENDENCY(BogusControlFlow);
 INITIALIZE_PASS_DEPENDENCY(Flattening);
 INITIALIZE_PASS_DEPENDENCY(FunctionCallObfuscate);
 INITIALIZE_PASS_DEPENDENCY(IndirectBranch);
+INITIALIZE_PASS_DEPENDENCY(FunctionNameObfuscation);
+INITIALIZE_PASS_DEPENDENCY(ClassNameObfuscation);
+INITIALIZE_PASS_DEPENDENCY(ObjCSelectorObfuscation);
+INITIALIZE_PASS_DEPENDENCY(ObjCPropertyObfuscation);
+INITIALIZE_PASS_DEPENDENCY(SwiftSymbolObfuscation);
+INITIALIZE_PASS_DEPENDENCY(MetadataStringObfuscation);
+INITIALIZE_PASS_DEPENDENCY(SymbolVisibilityObfuscation);
+INITIALIZE_PASS_DEPENDENCY(DependencyDiversification);
 INITIALIZE_PASS_DEPENDENCY(SplitBasicBlock);
 INITIALIZE_PASS_DEPENDENCY(StringEncryption);
 INITIALIZE_PASS_DEPENDENCY(Substitution);
@@ -281,6 +380,27 @@ PassPluginLibraryInfo getHikariPluginInfo() {
                     EnableConstantEncryption = true;
                   } else if (Element.Name == EnableIndirectBranching.ArgStr) {
                     EnableIndirectBranching = true;
+                  } else if (Element.Name ==
+                             EnableFunctionNameObfuscation.ArgStr) {
+                    EnableFunctionNameObfuscation = true;
+                  } else if (Element.Name ==
+                             EnableClassNameObfuscation.ArgStr) {
+                    EnableClassNameObfuscation = true;
+                  } else if (Element.Name == EnableObjCSelectorObfuscation.ArgStr) {
+                    EnableObjCSelectorObfuscation = true;
+                  } else if (Element.Name == EnableObjCPropertyObfuscation.ArgStr) {
+                    EnableObjCPropertyObfuscation = true;
+                  } else if (Element.Name == EnableSwiftSymbolObfuscation.ArgStr) {
+                    EnableSwiftSymbolObfuscation = true;
+                  } else if (Element.Name ==
+                             EnableMetadataStringObfuscation.ArgStr) {
+                    EnableMetadataStringObfuscation = true;
+                  } else if (Element.Name ==
+                             EnableSymbolVisibilityObfuscation.ArgStr) {
+                    EnableSymbolVisibilityObfuscation = true;
+                  } else if (Element.Name ==
+                             EnableDependencyDiversification.ArgStr) {
+                    EnableDependencyDiversification = true;
                   } else if (Element.Name == EnableFunctionWrapper.ArgStr) {
                     EnableFunctionWrapper = true;
                   }

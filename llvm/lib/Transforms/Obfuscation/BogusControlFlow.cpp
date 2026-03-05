@@ -94,6 +94,7 @@
 #include "llvm/Transforms/Obfuscation/BogusControlFlow.h"
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -195,6 +196,31 @@ struct BogusControlFlow : public FunctionPass {
   static char ID; // Pass identification
   bool flag;
   SmallVector<const ICmpInst *, 8> needtoedit;
+  // Cache Swift module detection per module pointer
+  Module *lastCheckedModule = nullptr;
+  bool lastModuleIsSwift = false;
+  bool isSwiftModule(Module &M) {
+    if (&M == lastCheckedModule)
+      return lastModuleIsSwift;
+    lastCheckedModule = &M;
+    lastModuleIsSwift = false;
+    for (const Function &Fn : M) {
+      if (Fn.getCallingConv() == CallingConv::Swift) {
+        lastModuleIsSwift = true;
+        break;
+      }
+      StringRef N = Fn.getName();
+#if LLVM_VERSION_MAJOR >= 18
+      if (N.starts_with("$s") || N.starts_with("_$s")) {
+#else
+      if (N.startswith("$s") || N.startswith("_$s")) {
+#endif
+        lastModuleIsSwift = true;
+        break;
+      }
+    }
+    return lastModuleIsSwift;
+  }
   BogusControlFlow() : FunctionPass(ID) { this->flag = true; }
   BogusControlFlow(bool flag) : FunctionPass(ID) { this->flag = flag; }
   /* runOnFunction
@@ -203,6 +229,11 @@ struct BogusControlFlow : public FunctionPass {
    * to the function. See header for more details.
    */
   bool runOnFunction(Function &F) override {
+    // Skip Swift modules — BogusControlFlow corrupts Swift #available checks
+    // and other runtime-sensitive control flow patterns, causing crashes on
+    // older iOS versions (e.g. _setSecurityModeForViewsLayer on iOS 15).
+    if (isSwiftModule(*F.getParent()))
+      return false;
     if (!toObfuscateUint32Option(&F, "bcf_loop", &ObfTimesTemp))
       ObfTimesTemp = ObfTimes;
 
@@ -752,12 +783,14 @@ struct BogusControlFlow : public FunctionPass {
           ConstantInt::get(I32Ty, cryptoutils->get_range(1, UINT32_MAX));
       Constant *RHSC =
           ConstantInt::get(I32Ty, cryptoutils->get_range(1, UINT32_MAX));
+      std::string lhsName = (Twine("LHSGV.") + Twine::utohexstr(hash_value(F.getName()))).str();
       GlobalVariable *LHSGV =
           new GlobalVariable(M, Type::getInt32Ty(M.getContext()), false,
-                             GlobalValue::PrivateLinkage, LHSC, "LHSGV");
+                             GlobalValue::PrivateLinkage, LHSC, lhsName);
+      std::string rhsName = (Twine("RHSGV.") + Twine::utohexstr(hash_value(F.getName()))).str();
       GlobalVariable *RHSGV =
           new GlobalVariable(M, Type::getInt32Ty(M.getContext()), false,
-                             GlobalValue::PrivateLinkage, RHSC, "RHSGV");
+                             GlobalValue::PrivateLinkage, RHSC, rhsName);
       LoadInst *LHS =
           (CreateFunctionForOpaquePredicateTemp ? IRBOp : IRBReal)
               ->CreateLoad(LHSGV->getValueType(), LHSGV, "Initial LHS");

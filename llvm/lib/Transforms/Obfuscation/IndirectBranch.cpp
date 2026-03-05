@@ -4,6 +4,7 @@
 #include "llvm/Transforms/Obfuscation/IndirectBranch.h"
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
@@ -39,6 +40,31 @@ struct IndirectBranch : public FunctionPass {
   std::unordered_map<BasicBlock *, unsigned long long> indexmap;
   std::unordered_map<Function *, ConstantInt *> encmap;
   std::unordered_set<Function *> to_obf_funcs;
+  // Cache Swift module detection
+  Module *lastCheckedModule = nullptr;
+  bool lastModuleIsSwift = false;
+  bool isSwiftModule(Module &M) {
+    if (&M == lastCheckedModule)
+      return lastModuleIsSwift;
+    lastCheckedModule = &M;
+    lastModuleIsSwift = false;
+    for (const Function &Fn : M) {
+      if (Fn.getCallingConv() == CallingConv::Swift) {
+        lastModuleIsSwift = true;
+        break;
+      }
+      StringRef N = Fn.getName();
+#if LLVM_VERSION_MAJOR >= 18
+      if (N.starts_with("$s") || N.starts_with("_$s")) {
+#else
+      if (N.startswith("$s") || N.startswith("_$s")) {
+#endif
+        lastModuleIsSwift = true;
+        break;
+      }
+    }
+    return lastModuleIsSwift;
+  }
   IndirectBranch() : FunctionPass(ID) {
     this->flag = true;
     this->initialized = false;
@@ -49,6 +75,12 @@ struct IndirectBranch : public FunctionPass {
   }
   StringRef getPassName() const override { return "IndirectBranch"; }
   bool initialize(Module &M) {
+    // Skip Swift modules — IndirectBranch can corrupt Swift runtime-sensitive
+    // control flow patterns
+    if (isSwiftModule(M)) {
+      this->initialized = true;
+      return false;
+    }
     PassBuilder PB;
     FunctionAnalysisManager FAM;
     FunctionPassManager FPM;
@@ -95,10 +127,11 @@ struct IndirectBranch : public FunctionPass {
           Type::getInt8Ty(M.getContext())->getPointerTo(), BBs.size());
       Constant *BlockAddressArray =
           ConstantArray::get(AT, ArrayRef<Constant *>(BBs));
+      std::string tableName = (Twine("IndirectBranchingGlobalTable.") + Twine::utohexstr(hash_value(M.getSourceFileName()))).str();
       GlobalVariable *Table = new GlobalVariable(
           M, AT, false, GlobalValue::LinkageTypes::PrivateLinkage,
-          BlockAddressArray, "IndirectBranchingGlobalTable");
-      appendToCompilerUsed(M, {Table});
+          BlockAddressArray, tableName);
+      appendToCompilerUsed(*Table->getParent(), {Table});
     }
     this->initialized = true;
     return true;
@@ -155,12 +188,13 @@ struct IndirectBranch : public FunctionPass {
         // Create a new GV
         Constant *BlockAddressArray =
             ConstantArray::get(AT, ArrayRef<Constant *>(BlockAddresses));
+        std::string condTableName = (Twine("HikariConditionalLocalIndirectBranchingTable.") + Twine::utohexstr(hash_value(Func.getName()))).str();
         LoadFrom = new GlobalVariable(
             *M, AT, false, GlobalValue::LinkageTypes::PrivateLinkage,
-            BlockAddressArray, "HikariConditionalLocalIndirectBranchingTable");
-        appendToCompilerUsed(*Func.getParent(), {LoadFrom});
+            BlockAddressArray, condTableName);
       } else {
-        LoadFrom = M->getGlobalVariable("IndirectBranchingGlobalTable", true);
+        std::string globalTableName = (Twine("IndirectBranchingGlobalTable.") + Twine::utohexstr(hash_value(M->getSourceFileName()))).str();
+        LoadFrom = M->getGlobalVariable(globalTableName, true);
       }
       AllocaInst *LoadFromAI = nullptr;
       if (UseStackTemp) {
@@ -186,13 +220,13 @@ struct IndirectBranch : public FunctionPass {
                                         Int32Ty, cryptoutils->get_uint32_t()))
                                   : nullptr;
         if (EncryptJumpTargetTemp) {
+          std::string indexName = (Twine("IndirectBranchingIndex.") + Twine::utohexstr(hash_value(Func.getName()))).str();
           GlobalVariable *indexgv = new GlobalVariable(
               *M, Int32Ty, false, GlobalValue::LinkageTypes::PrivateLinkage,
               ConstantInt::get(IndexEncKey->getType(),
                                IndexEncKey->getValue() ^
                                    indexmap[BI->getSuccessor(0)]),
-              "IndirectBranchingIndex");
-          appendToCompilerUsed(*M, {indexgv});
+              indexName);
           indexval = (UseStackTemp ? IRBEntry : IRBBI)
                          ->CreateLoad(indexgv->getValueType(), indexgv);
         } else {
@@ -232,12 +266,12 @@ struct IndirectBranch : public FunctionPass {
       if (EncryptJumpTargetTemp) {
         ConstantInt *encenckey = cast<ConstantInt>(
             ConstantInt::get(Int32Ty, cryptoutils->get_uint32_t()));
+        std::string encKeyName = (Twine("IndirectBranchingAddressEncryptKey.") + Twine::utohexstr(hash_value(Func.getName()))).str();
         GlobalVariable *enckeyGV = new GlobalVariable(
             *M, Int32Ty, false, GlobalValue::LinkageTypes::PrivateLinkage,
             ConstantInt::get(Int32Ty,
                              encenckey->getValue() ^ encmap[&Func]->getValue()),
-            "IndirectBranchingAddressEncryptKey");
-        appendToCompilerUsed(*M, enckeyGV);
+            encKeyName);
         enckeyLoad = IRBBI->CreateXor(
             IRBBI->CreateLoad(enckeyGV->getValueType(), enckeyGV), encenckey);
         LI =

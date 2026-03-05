@@ -8,11 +8,19 @@ add_llvm_component_library(LLVMObfuscation
         Utils.cpp
         SplitBasicBlocks.cpp
         AntiClassDump.cpp
+        ClassNameObfuscation.cpp
+        ObjCSelectorObfuscation.cpp
+        ObjCPropertyObfuscation.cpp
         AntiDebugging.cpp
         AntiHooking.cpp
         StringEncryption.cpp
+        MetadataStringObfuscation.cpp
         IndirectBranch.cpp
+        FunctionNameObfuscation.cpp
+        SwiftSymbolObfuscation.cpp
         FunctionWrapper.cpp
+        SymbolVisibilityObfuscation.cpp
+        DependencyDiversification.cpp
         ConstantEncryption.cpp
         Obfuscation.cpp
         DEPENDS

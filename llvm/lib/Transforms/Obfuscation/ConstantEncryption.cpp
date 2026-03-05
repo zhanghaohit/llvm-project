@@ -82,20 +82,23 @@ struct ConstantEncryption : public ModulePass {
     return Name.contains("dispatch_once") || Name.contains("swift_once");
 #endif
   }
-  // Swift runtime heavily relies on immutable constants and specific layouts;
-  // obfuscating those tends to crash (e.g. RxSwift DisposeBag). Guard them out.
-  static bool isSwiftFunction(const Function &F) {
-    CallingConv::ID CC = F.getCallingConv();
-    if (CC == CallingConv::Swift)
-      return true;
-    StringRef N = F.getName();
+  // Detect if the module is a Swift module by checking for any function with
+  // Swift calling convention or $s-mangled names. Swift modules contain
+  // @objc thunks that look like C functions but share metadata/constants
+  // with Swift runtime structures — encrypting them causes runtime crashes.
+  static bool isSwiftModule(const Module &M) {
+    for (const Function &F : M) {
+      if (F.getCallingConv() == CallingConv::Swift)
+        return true;
+      StringRef N = F.getName();
 #if LLVM_VERSION_MAJOR >= 18
-    return N.starts_with("$s") || N.starts_with("$S") ||
-           N.starts_with("_$s") || N.starts_with("_$S");
+      if (N.starts_with("$s") || N.starts_with("_$s"))
 #else
-    return N.startswith("$s") || N.startswith("$S") ||
-           N.startswith("_$s") || N.startswith("_$S");
+      if (N.startswith("$s") || N.startswith("_$s"))
 #endif
+        return true;
+    }
+    return false;
   }
   ConstantEncryption(bool flag) : ModulePass(ID) { this->flag = flag; }
   ConstantEncryption() : ModulePass(ID) { this->flag = true; }
@@ -140,6 +143,14 @@ struct ConstantEncryption : public ModulePass {
     return true;
   }
   bool runOnModule(Module &M) override {
+    // Skip entire Swift modules — Swift @objc thunks share constant data
+    // with Swift runtime metadata; encrypting them causes runtime crashes.
+    // ObjC modules compiled by clang are not affected.
+    if (isSwiftModule(M)) {
+      errs() << "ConstantEncryption: Skipping Swift module "
+             << M.getSourceFileName() << "\n";
+      return false;
+    }
     dispatchonce = false;
     for (Function &Fn : M) {
       if (isOnceFunctionName(Fn.getName())) {
@@ -147,9 +158,7 @@ struct ConstantEncryption : public ModulePass {
         break;
       }
     }
-    for (Function &F : M) {
-      if (isSwiftFunction(F))
-        continue; // Swift runtime/layout is fragile; skip constant encryption.
+    for (Function &F : M)
       if (toObfuscate(flag, &F, "constenc") && !F.isPresplitCoroutine()) {
         errs() << "Running ConstantEncryption On " << F.getName() << "\n";
         FixFunctionConstantExpr(&F);
@@ -182,7 +191,6 @@ struct ConstantEncryption : public ModulePass {
           times--;
         }
       }
-    }
     return true;
   }
 

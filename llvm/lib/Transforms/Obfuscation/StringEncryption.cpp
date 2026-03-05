@@ -4,6 +4,7 @@
 #include "llvm/Transforms/Obfuscation/StringEncryption.h"
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
@@ -54,6 +55,8 @@ struct StringEncryption : public ModulePass {
 #endif
         !(GV->getSection().contains("__objc") &&
           !GV->getSection().contains("array")) &&
+        !GV->getSection().contains("__cfstring") &&
+        !GV->getSection().contains("__swift") &&
         !GV->getName().contains("OBJC") &&
         std::find(genedgv.begin(), genedgv.end(), GV) == genedgv.end() &&
         ((GV->getLinkage() == GlobalValue::LinkageTypes::PrivateLinkage ||
@@ -90,15 +93,21 @@ struct StringEncryption : public ModulePass {
         }
         Constant *S =
             ConstantInt::getNullValue(Type::getInt32Ty(M.getContext()));
+        std::string encStatusName = (Twine("StringEncryptionEncStatus.") + Twine::utohexstr(hash_value(F.getName()))).str();
         GlobalVariable *GV = new GlobalVariable(
             M, S->getType(), false, GlobalValue::LinkageTypes::PrivateLinkage,
-            S, "StringEncryptionEncStatus");
+            S, encStatusName);
         encstatus[&F] = GV;
         HandleFunction(&F);
       }
+    // Cleanup: only delete original GVs that have zero remaining uses.
+    // Do NOT call removeDeadConstantUsers() — it can cascade through
+    // constant chains (ConstantExpr → ConstantStruct → GV initializer)
+    // and remove constants that are part of Swift metadata structures
+    // (__swift5_reflstr, __swift5_typeref, protocol conformances, etc.).
+    // Even if a constant appears "dead" locally, it may be referenced
+    // at runtime via section-based metadata walking.
     for (GlobalVariable *GV : globalProcessedGVs) {
-      errs() << "Post-cleaning work: " << GV << "\n";
-      GV->removeDeadConstantUsers();
       if (GV->getNumUses() == 0) {
         GV->dropAllReferences();
         GV->eraseFromParent();
@@ -245,18 +254,73 @@ struct StringEncryption : public ModulePass {
           GV2Keys[ugv] = mgv2keysval;
         }
       }
+    // Filter rawStrings:
+    // 1. Skip GVs with no instruction uses in this function (dead processing).
+    // 2. Skip GVs that are referenced by GV initializers (metadata).
+    //    Swift metadata (type descriptors, protocol conformance, reflection
+    //    strings) references string GVs through constant expressions in GV
+    //    initializers. While instruction-only replacement preserves these
+    //    references, the cleanup phase's removeDeadConstantUsers() can cascade
+    //    and remove constant chains, potentially leaving metadata dangling.
+    //    Also, the dual-path (instruction reads decrypted, metadata reads
+    //    original) is fragile — safest to skip GVs with metadata references.
+    {
+      std::unordered_set<GlobalVariable *> filteredRawStrings;
+      for (GlobalVariable *GV : rawStrings) {
+        bool hasInstUseInFunc = false;
+        bool hasGVInitializerUse = false;
+        for (auto UI = GV->use_begin(), UE = GV->use_end(); UI != UE; ++UI) {
+          User *U = UI->getUser();
+          if (Instruction *I = dyn_cast<Instruction>(U)) {
+            if (I->getFunction() == Func) {
+              hasInstUseInFunc = true;
+            }
+          } else if (Constant *C = dyn_cast<Constant>(U)) {
+            // Check if this constant user leads to a GV initializer
+            // (i.e., is part of metadata, not just a ConstantExpr in
+            // another function's instruction).
+            // Walk up one level: if any user of C is a GlobalVariable,
+            // then C is part of that GV's initializer → metadata use.
+            for (User *CU : C->users()) {
+              if (isa<GlobalVariable>(CU)) {
+                hasGVInitializerUse = true;
+                break;
+              }
+              // Also check nested constants (ConstantExpr → ConstantStruct → GV)
+              if (Constant *CC = dyn_cast<Constant>(CU)) {
+                for (User *CCU : CC->users()) {
+                  if (isa<GlobalVariable>(CCU)) {
+                    hasGVInitializerUse = true;
+                    break;
+                  }
+                }
+              }
+              if (hasGVInitializerUse) break;
+            }
+          }
+        }
+        if (hasInstUseInFunc && !hasGVInitializerUse)
+          filteredRawStrings.insert(GV);
+      }
+      rawStrings = filteredRawStrings;
+    }
+
     for (GlobalVariable *GV : rawStrings) {
       if (GV->getInitializer()->isZeroValue() ||
           GV->getInitializer()->isNullValue())
         continue;
       auto globalIt = globalOld2New.find(GV);
       if (globalIt != globalOld2New.end()) {
-        errs() << "Found shared global variable: " << GV << "\n";
-        old2new[GV] = globalIt->second;
-        // 更新当前函数的GV2Keys和mgv2keys
-        GV2Keys[globalIt->second.second] = mgv2keys[globalIt->second.second];
-        mgv2keys[globalIt->second.second] = GV2Keys[globalIt->second.second];
-        continue; // 跳过生成新变量步骤
+        GlobalVariable *SharedDecryptGV = globalIt->second.second;
+        auto mgvIt = mgv2keys.find(SharedDecryptGV);
+        if (mgvIt != mgv2keys.end() && mgvIt->second.first &&
+            mgvIt->second.second) {
+          old2new[GV] = globalIt->second;
+          GV2Keys[SharedDecryptGV] = mgvIt->second;
+          continue;
+        }
+        // mgv2keys entry missing or invalid — fall through to create fresh
+        // encryption for this function instead of reusing stale data
       }
       ConstantDataSequential *CDS =
           dyn_cast<ConstantDataSequential>(GV->getInitializer());
@@ -269,6 +333,13 @@ struct StringEncryption : public ModulePass {
         continue;
       }
       IntegerType *intType = cast<IntegerType>(ElementTy);
+      // Only encrypt i8 arrays (actual string data).
+      // Skip i16/i32/i64 arrays which are compiler-generated data structures
+      // (switch lookup tables, jump tables, relative offset tables, etc.).
+      // Encrypting non-string data can corrupt Swift control flow and metadata.
+      if (intType->getBitWidth() > 8) {
+        continue;
+      }
       Constant *KeyConst, *EncryptedConst, *DummyConst = nullptr;
       unencryptedindex[GV] = {};
       if (intType == Type::getInt8Ty(M->getContext())) {
@@ -360,23 +431,43 @@ struct StringEncryption : public ModulePass {
         llvm_unreachable("Unsupported CDS Type");
       }
       // Prepare new rawGV
+      // Use PrivateLinkage to produce truly local (l_ prefixed) MachO symbols
+      // that don't conflict across .o files in Swift batch compilation mode
+      std::string encStrName = (Twine("EncryptedString.") + Twine::utohexstr(hash_value(Func->getName()))).str();
       GlobalVariable *EncryptedRawGV = new GlobalVariable(
-          *M, EncryptedConst->getType(), false, GV->getLinkage(),
-          EncryptedConst, "EncryptedString", nullptr, GV->getThreadLocalMode(),
+          *M, EncryptedConst->getType(), false,
+          GlobalValue::PrivateLinkage,
+          EncryptedConst, encStrName, nullptr, GV->getThreadLocalMode(),
           GV->getType()->getAddressSpace());
       genedgv.emplace_back(EncryptedRawGV);
       GlobalVariable *DecryptSpaceGV;
       if (rust_string) {
+        // Build a NEW ConstantAggregate with DummyConst instead of modifying
+        // the original GV's initializer in place. The old code did
+        // CA->setOperand(0, DummyConst) which corrupted the original GV's
+        // data — any constant users (metadata, other GVs) would see garbage.
         ConstantAggregate *CA = cast<ConstantAggregate>(GV->getInitializer());
-        CA->setOperand(0, DummyConst);
+        SmallVector<Constant *, 4> NewOps;
+        for (unsigned i = 0; i < CA->getNumOperands(); i++) {
+          NewOps.push_back(i == 0 ? DummyConst : CA->getOperand(i));
+        }
+        Constant *NewCA;
+        if (auto *SAT = dyn_cast<StructType>(CA->getType()))
+          NewCA = ConstantStruct::get(SAT, NewOps);
+        else
+          NewCA = ConstantArray::get(cast<ArrayType>(CA->getType()), NewOps);
+        std::string decryptRustName = (Twine("DecryptSpaceRust.") + Twine::utohexstr(hash_value(Func->getName()))).str();
         DecryptSpaceGV = new GlobalVariable(
-            *M, GV->getValueType(), false, GV->getLinkage(), CA,
-            "DecryptSpaceRust", nullptr, GV->getThreadLocalMode(),
+            *M, GV->getValueType(), false,
+            GlobalValue::PrivateLinkage, NewCA,
+            decryptRustName, nullptr, GV->getThreadLocalMode(),
             GV->getType()->getAddressSpace());
       } else {
+        std::string decryptName = (Twine("DecryptSpace.") + Twine::utohexstr(hash_value(Func->getName()))).str();
         DecryptSpaceGV = new GlobalVariable(
-            *M, DummyConst->getType(), false, GV->getLinkage(), DummyConst,
-            "DecryptSpace", nullptr, GV->getThreadLocalMode(),
+            *M, DummyConst->getType(), false,
+            GlobalValue::PrivateLinkage, DummyConst,
+            decryptName, nullptr, GV->getThreadLocalMode(),
             GV->getType()->getAddressSpace());
       }
       genedgv.emplace_back(DecryptSpaceGV);
@@ -396,33 +487,37 @@ struct StringEncryption : public ModulePass {
       if (old2new.find(oldrawString) ==
           old2new.end()) // Filter out zero initializers
         continue;
+      std::string encObjCName = (Twine("EncryptedStringObjC.") + Twine::utohexstr(hash_value(Func->getName()))).str();
       GlobalVariable *EncryptedOCGV = ObjectiveCString(
-          GV, "EncryptedStringObjC", old2new[oldrawString].first, CS);
+          GV, encObjCName, old2new[oldrawString].first, CS);
       genedgv.emplace_back(EncryptedOCGV);
+      std::string decObjCName = (Twine("DecryptSpaceObjC.") + Twine::utohexstr(hash_value(Func->getName()))).str();
       GlobalVariable *DecryptSpaceOCGV = ObjectiveCString(
-          GV, "DecryptSpaceObjC", old2new[oldrawString].second, CS);
+          GV, decObjCName, old2new[oldrawString].second, CS);
       genedgv.emplace_back(DecryptSpaceOCGV);
       old2new[GV] = std::make_pair(EncryptedOCGV, DecryptSpaceOCGV);
     } // End prepare ObjC new GV
     if (GV2Keys.empty())
       return;
-    // Replace Uses
-    for (User *U : Users) {
-      for (std::unordered_map<
-               GlobalVariable *,
-               std::pair<GlobalVariable *, GlobalVariable *>>::iterator iter =
-               old2new.begin();
-           iter != old2new.end(); ++iter) {
-        if (isa<Constant>(U) && !isa<GlobalValue>(U)) {
-          Constant *C = cast<Constant>(U);
-          for (Value *Op : C->operands())
-            if (Op == iter->first) {
-              C->handleOperandChange(iter->first, iter->second.second);
-              break;
-            }
-        } else
-          U->replaceUsesOfWith(iter->first, iter->second.second);
-        iter->first->removeDeadConstantUsers();
+    // Replace Uses — only replace Instruction uses within this function.
+    // Do NOT use replaceAllUsesWith, because it replaces ALL uses globally,
+    // including uses in GV initializers (e.g., ObjC metadata structs).
+    // GV initializer uses are read at load time by the ObjC runtime BEFORE
+    // any function's decryption block runs.
+    for (auto iter = old2new.begin(); iter != old2new.end(); ++iter) {
+      GlobalVariable *OldGV = iter->first;
+      GlobalVariable *NewGV = iter->second.second;
+      SmallVector<Use *, 16> InstUses;
+      for (auto UI = OldGV->use_begin(), UE = OldGV->use_end(); UI != UE;
+           ++UI) {
+        if (Instruction *I = dyn_cast<Instruction>(UI->getUser())) {
+          if (I->getFunction() == Func) {
+            InstUses.push_back(&*UI);
+          }
+        }
+      }
+      for (Use *U : InstUses) {
+        U->set(NewGV);
       }
     } // End Replace Uses
     // CleanUp Old ObjC GVs
@@ -549,7 +644,8 @@ struct StringEncryption : public ModulePass {
     Constant *newCS =
         ConstantStruct::get(CS->getType(), ArrayRef<Constant *>(vals));
     GlobalVariable *ObjcGV = new GlobalVariable(
-        *(GV->getParent()), newCS->getType(), false, GV->getLinkage(), newCS,
+        *(GV->getParent()), newCS->getType(), false,
+        GlobalValue::PrivateLinkage, newCS,
         name, nullptr, GV->getThreadLocalMode(),
         GV->getType()->getAddressSpace());
     // for arm64e target on Apple LLVM
@@ -593,18 +689,31 @@ struct StringEncryption : public ModulePass {
          iter != GV2Keys.end(); ++iter) {
       bool rust_string =
           !isa<ConstantDataSequential>(iter->first->getInitializer());
-      ConstantAggregate *CA =
-          rust_string ? cast<ConstantAggregate>(iter->first->getInitializer())
-                      : nullptr;
       Constant *KeyConst = iter->second.first;
-      ConstantDataArray *CastedCDA = cast<ConstantDataArray>(KeyConst);
-      // Prevent optimization of encrypted data
-      appendToCompilerUsed(*iter->second.second->getParent(),
-                           {iter->second.second});
+      if (!KeyConst) {
+        errs() << "WARNING: null KeyConst for DecryptSpaceGV "
+               << iter->first->getName() << ", skipping\n";
+        continue;
+      }
+      ConstantDataArray *CastedCDA = dyn_cast<ConstantDataArray>(KeyConst);
+      if (!CastedCDA) {
+        errs() << "WARNING: KeyConst is not ConstantDataArray for "
+               << iter->first->getName() << ", skipping\n";
+        continue;
+      }
+      GlobalVariable *EncRawGV = iter->second.second;
+      if (!EncRawGV) {
+        errs() << "WARNING: null EncryptedRawGV for "
+               << iter->first->getName() << ", skipping\n";
+        continue;
+      }
+      // Verify sizes match: KeyConst and DecryptSpaceGV should have
+      // same number of elements
+      uint64_t keyElements = CastedCDA->getType()->getNumElements();
       // Element-By-Element XOR so the fucking verifier won't complain
       // Also, this hides keys
       uint64_t realkeyoff = 0;
-      for (uint64_t i = 0; i < CastedCDA->getType()->getNumElements(); i++) {
+      for (uint64_t i = 0; i < keyElements; i++) {
         if (unencryptedindex[KeyConst].size() &&
             std::find(unencryptedindex[KeyConst].begin(),
                       unencryptedindex[KeyConst].end(),
@@ -613,20 +722,24 @@ struct StringEncryption : public ModulePass {
         Value *offset =
             ConstantInt::get(Type::getInt64Ty(B->getContext()), realkeyoff);
         Value *offset2 = ConstantInt::get(Type::getInt64Ty(B->getContext()), i);
-        Value *EncryptedGEP =
-            IRB.CreateGEP(iter->second.second->getValueType(),
-                          iter->second.second, {zero, offset});
-        Value *DecryptedGEP =
-            rust_string
-                ? IRB.CreateGEP(
-                      CA->getOperand(0)->getType(),
-                      IRB.CreateGEP(
-                          CA->getType(), iter->first,
-                          {zero, ConstantInt::getNullValue(
-                                     Type::getInt64Ty(B->getContext()))}),
-                      {zero, offset2})
-                : IRB.CreateGEP(iter->first->getValueType(), iter->first,
-                                {zero, offset2});
+        // Use GetElementPtrInst directly (via IRB.Insert) instead of
+        // IRB.CreateGEP to prevent LLVM's constant folder from attempting to
+        // merge ConstantExpr GEPs, which crashes in StructType::getTypeAtIndex
+        // when the type hierarchy contains struct types.
+        SmallVector<Value *, 2> EncIdxs = {zero, offset};
+        Value *EncryptedGEP = IRB.Insert(GetElementPtrInst::Create(
+            iter->second.second->getValueType(), iter->second.second, EncIdxs));
+        SmallVector<Value *, 3> DecIdxs;
+        if (rust_string) {
+          DecIdxs = {zero,
+                     ConstantInt::getNullValue(
+                         Type::getInt32Ty(B->getContext())),
+                     offset2};
+        } else {
+          DecIdxs = {zero, offset2};
+        }
+        Value *DecryptedGEP = IRB.Insert(GetElementPtrInst::Create(
+            iter->first->getValueType(), iter->first, DecIdxs));
         LoadInst *LI = IRB.CreateLoad(CastedCDA->getElementType(), EncryptedGEP,
                                       "EncryptedChar");
         Value *XORed = IRB.CreateXor(LI, CastedCDA->getElementAsConstant(i));
