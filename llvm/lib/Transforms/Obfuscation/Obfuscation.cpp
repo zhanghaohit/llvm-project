@@ -8,6 +8,7 @@
 */
 #include "llvm/Transforms/Obfuscation/Obfuscation.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/CommandLine.h"
@@ -247,16 +248,18 @@ struct Obfuscation : public ModulePass {
                                            EnableFunctionNameObfuscation);
     MP->runOnModule(M);
     delete MP;
-    MP = createClassNameObfuscationPass(EnableAllObfuscation ||
-                                        EnableClassNameObfuscation);
-    MP->runOnModule(M);
-    delete MP;
+    // Run selobf/propobf BEFORE clsobf: clsobf modifies __objc_classname GV
+    // values, which invalidates use-chain analysis that selobf/propobf depend on.
     MP = createObjCSelectorObfuscationPass(EnableAllObfuscation ||
                                            EnableObjCSelectorObfuscation);
     MP->runOnModule(M);
     delete MP;
     MP = createObjCPropertyObfuscationPass(EnableAllObfuscation ||
                                            EnableObjCPropertyObfuscation);
+    MP->runOnModule(M);
+    delete MP;
+    MP = createClassNameObfuscationPass(EnableAllObfuscation ||
+                                        EnableClassNameObfuscation);
     MP->runOnModule(M);
     delete MP;
     MP = createSwiftSymbolObfuscationPass(EnableAllObfuscation ||
@@ -275,6 +278,34 @@ struct Obfuscation : public ModulePass {
         EnableAllObfuscation || EnableDependencyDiversification);
     MP->runOnModule(M);
     delete MP;
+    // Fix PHI nodes with duplicate entries for the same basic block.
+    // Obfuscation passes (BogusControlFlow, IndirectBranch) can create
+    // conditional branches where both targets are the same block, producing
+    // PHI nodes with multiple entries from the same predecessor but different
+    // SSA values. The LLVM verifier rejects this. Fix by setting duplicate
+    // entries to use the same value as the first entry for that predecessor.
+    for (Function &F : M) {
+      if (F.isDeclaration())
+        continue;
+      for (BasicBlock &BB : F) {
+        for (auto It = BB.begin(); It != BB.end(); ++It) {
+          PHINode *PN = dyn_cast<PHINode>(&*It);
+          if (!PN) break; // PHIs are always at the start of a BB
+          SmallDenseMap<BasicBlock *, unsigned, 8> Seen;
+          for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i) {
+            BasicBlock *Pred = PN->getIncomingBlock(i);
+            auto Res = Seen.try_emplace(Pred, i);
+            if (!Res.second) {
+              // Duplicate predecessor: set this entry's value to match the
+              // first entry from the same predecessor.
+              unsigned FirstIdx = Res.first->second;
+              PN->setIncomingValue(i, PN->getIncomingValue(FirstIdx));
+            }
+          }
+        }
+      }
+    }
+
     // Cleanup Flags
     SmallVector<Function *, 8> toDelete;
     for (Function &F : M)

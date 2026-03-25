@@ -4761,11 +4761,22 @@ bool AddressingModeMatcher::matchOperationAddr(User *AddrInst, unsigned Opcode,
     gep_type_iterator GTI = gep_type_begin(AddrInst);
     for (unsigned i = 1, e = AddrInst->getNumOperands(); i != e; ++i, ++GTI) {
       if (StructType *STy = GTI.getStructTypeOrNull()) {
+        // Struct field index must be a constant in valid IR, but a variable
+        // index on a struct element type (e.g. getelementptr %S, ptr %p, i64
+        // %n) is valid pointer arithmetic on an array-of-structs. Guard against
+        // a non-constant to avoid crashing in cast<ConstantInt>.
+        ConstantInt *CI = dyn_cast<ConstantInt>(AddrInst->getOperand(i));
+        if (!CI)
+          return false;
         const StructLayout *SL = DL.getStructLayout(STy);
-        unsigned Idx =
-            cast<ConstantInt>(AddrInst->getOperand(i))->getZExtValue();
+        unsigned Idx = CI->getZExtValue();
         ConstantOffset += SL->getElementOffset(Idx);
       } else {
+        // CurTy may be a null StructType* (from iterating past a scalar element
+        // type), in which case getIndexedType() would dereference null. Guard
+        // against this by checking isSequential() (true only for Type* CurTy).
+        if (!GTI.isSequential())
+          return false;
         TypeSize TS = DL.getTypeAllocSize(GTI.getIndexedType());
         if (TS.isNonZero()) {
           // The optimisations below currently only work for fixed offsets.

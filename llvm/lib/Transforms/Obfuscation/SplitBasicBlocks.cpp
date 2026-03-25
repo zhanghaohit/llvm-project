@@ -112,6 +112,7 @@ struct SplitBasicBlock : public FunctionPass {
     return false;
   }
 
+
   void split_point_shuffle(SmallVector<size_t, 32> &vec) {
     int n = vec.size();
     for (int i = n - 1; i > 0; --i)

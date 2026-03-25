@@ -87,6 +87,14 @@ struct AntiClassDump : public ModulePass {
   }
   bool runOnModule(Module &M) override {
     errs() << "Running AntiClassDump On " << M.getSourceFileName() << "\n";
+    // Skip DummyClasses.m — it contains 2000+ synthetic WK classes with
+    // 8000+ methods. Running acdobf on it generates an enormous number of
+    // class_replaceMethod() constructors and can exhaust compiler memory.
+    // Dummy classes don't need anti-class-dump protection.
+    if (M.getSourceFileName().find("DummyClasses") != std::string::npos) {
+      errs() << "[AntiClassDump] Skipping DummyClasses (synthetic file)\n";
+      return false;
+    }
     SmallVector<GlobalVariable *, 32> OLCGVs;
     for (GlobalVariable &GV : M.globals()) {
 #if LLVM_VERSION_MAJOR >= 18

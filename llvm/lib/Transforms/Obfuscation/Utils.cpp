@@ -249,13 +249,29 @@ void FixBasicBlockConstantExpr(BasicBlock *BB) {
     if (isa<LandingPadInst>(I) || isa<FuncletPadInst>(I) ||
         isa<IntrinsicInst>(I))
       continue;
+    // For PHI nodes: cache CE→Instruction mapping to avoid creating duplicate
+    // instructions for the same ConstantExpr. A PHI can have multiple entries
+    // from the same basic block (e.g., switch with two cases going to the same
+    // target). If both entries use the same CE, we must reuse the same
+    // materialized instruction — otherwise we get two different SSA values
+    // from the same block, which violates the PHI invariant.
+    llvm::DenseMap<ConstantExpr *, Instruction *> CECache;
     for (unsigned int i = 0; i < I.getNumOperands(); i++)
       if (ConstantExpr *C = dyn_cast<ConstantExpr>(I.getOperand(i))) {
+        if (isa<PHINode>(I)) {
+          auto It = CECache.find(C);
+          if (It != CECache.end()) {
+            I.setOperand(i, It->second);
+            continue;
+          }
+        }
         IRBuilder<NoFolder> IRB(&I);
         if (isa<PHINode>(I))
           IRB.SetInsertPoint(FunctionInsertPt);
         Instruction *Inst = IRB.Insert(C->getAsInstruction());
         I.setOperand(i, Inst);
+        if (isa<PHINode>(I))
+          CECache[C] = Inst;
       }
   }
 }

@@ -715,16 +715,18 @@ struct ObjCSelectorObfuscation : public ModulePass {
     }
 
     // Prefix filter: only rename selectors starting with OBJCSELOBF_PREFIX.
-    // In mixed Swift/ObjC projects, Swift TUs skip this pass. Renaming any
-    // ObjC method that Swift code calls leads to "unrecognized selector"
-    // crashes. The prefix limits renaming to truly private ObjC-only methods.
-    // Set OBJCSELOBF_PREFIX=wk_private_ to rename only "wk_private_*" methods.
-    // Empty prefix (default) → safe no-op: no selectors renamed.
+    // If OBJCSELOBF_PREFIX is empty (default), rename ALL selectors that pass
+    // the blacklist + protocol + isOnlyUsedInLocalMethodLists checks.
+    // isOnlyUsedInLocalMethodLists() rejects any selector with instruction
+    // uses (selrefs) in the current TU, protecting same-TU Swift/ObjC calls.
+    // Cross-TU Swift callers are not visible here; set OBJCSELOBF_PREFIX to a
+    // private-only prefix (e.g. "wp_") if cross-TU safety is a concern.
     const std::string SelPrefix = getObjCSelObfPrefix();
-    if (SelPrefix.empty()) {
-      errs() << "[ObjCSelectorObfuscation] No OBJCSELOBF_PREFIX set — "
-                "skipping (safe no-op for mixed Swift/ObjC projects)\n";
-      return false;
+    const bool PrefixFilterEnabled = !SelPrefix.empty();
+    if (PrefixFilterEnabled) {
+      errs() << "[ObjCSelectorObfuscation] prefix filter: " << SelPrefix << "\n";
+    } else {
+      errs() << "[ObjCSelectorObfuscation] no prefix filter — renaming all safe selectors\n";
     }
 
     std::unordered_map<std::string, std::string> SelectorMap;
@@ -753,8 +755,8 @@ struct ObjCSelectorObfuscation : public ModulePass {
         continue;
       }
 
-      // Only rename selectors matching the user-specified prefix.
-      if (!startsWith(OldSelector, SelPrefix)) {
+      // Only rename selectors matching the user-specified prefix (if set).
+      if (PrefixFilterEnabled && !startsWith(OldSelector, SelPrefix)) {
         ++SkippedPrefix;
         continue;
       }

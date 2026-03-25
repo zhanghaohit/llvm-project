@@ -92,7 +92,6 @@ bool hasObjCMetadataUser(const GlobalVariable &GV) {
 
 bool shouldProcessStringGV(const GlobalVariable &GV, StringRef S) {
   StringRef Section = GV.getSection();
-  StringRef Name = GV.getName();
 
   // NEVER rename method names (selectors), method type encodings, or class
   // names. Selectors and types are used by the ObjC runtime for dispatch and
@@ -111,10 +110,23 @@ bool shouldProcessStringGV(const GlobalVariable &GV, StringRef S) {
     return false;
   }
 
-  // Only process GVs that look like metadata references
+  // Only process GVs that are clearly metadata references.
+  // IMPORTANT: Do NOT match ".str." (general C string constants) — this is
+  // far too broad and renames KVO keys, notification names, storyboard IDs,
+  // dictionary keys, etc., causing runtime crashes.
+  // Only match:
+  //   - GVs in __swift* sections (Swift metadata)
+  //   - GVs whose content starts with "$s" or "_$s" (Swift mangled names)
+  //   - GVs whose content starts with "_Tt" (Swift type names in ObjC interop)
+#if LLVM_VERSION_MAJOR >= 18
   bool IsCandidate = Section.contains("__swift") ||
-                     Name.contains("OBJC_") || Name.contains(".str.") ||
-                     S.contains("$s") || S.contains("_Tt");
+                     S.starts_with("$s") || S.starts_with("_$s") ||
+                     S.starts_with("_Tt");
+#else
+  bool IsCandidate = Section.contains("__swift") ||
+                     S.startswith("$s") || S.startswith("_$s") ||
+                     S.startswith("_Tt");
+#endif
   if (!IsCandidate)
     return false;
 

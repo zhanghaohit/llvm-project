@@ -692,6 +692,55 @@ struct ClassNameObfuscation : public ModulePass {
       }
     }
 
+    // ---- Phase 3: Patch property attribute strings ----
+    //
+    // Property attributes contain class references like T@"WKFoo",N,V_foo.
+    // When Phase 2 renames WKFoo → obfXyz in __objc_classname, other TUs'
+    // property attrs still reference T@"WKFoo". The ObjC runtime's
+    // property_copyAttributeValue("T") returns @"WKFoo", causing
+    // NSClassFromString(@"WKFoo") → nil (class registered as "obfXyz").
+    // Fix: find all T@"OldClass" patterns and replace with T@"NewClass".
+    // Since generateDeterministicClassName produces same-length names,
+    // the replacement is exact-length and the GV type is preserved.
+    unsigned PropPatched = 0;
+    for (GlobalVariable &GV : M.globals()) {
+      if (!GV.hasInitializer())
+        continue;
+      ConstantDataSequential *CDS =
+          dyn_cast<ConstantDataSequential>(GV.getInitializer());
+      if (!CDS || !CDS->isCString())
+        continue;
+      std::string Str = CDS->getAsCString().str();
+      if (Str.find("T@\"") == std::string::npos)
+        continue;
+
+      bool StrChanged = false;
+      for (const auto &KV : ObjCOnlyClassNameMap) {
+        std::string Pattern = "T@\"" + KV.first + "\"";
+        std::string Replacement = "T@\"" + KV.second + "\"";
+        size_t Pos = 0;
+        while ((Pos = Str.find(Pattern, Pos)) != std::string::npos) {
+          Str.replace(Pos, Pattern.size(), Replacement);
+          Pos += Replacement.size();
+          StrChanged = true;
+        }
+      }
+
+      if (StrChanged) {
+        Constant *NewInit =
+            ConstantDataArray::getString(M.getContext(), Str, true);
+        if (NewInit->getType() == GV.getValueType()) {
+          GV.setInitializer(NewInit);
+          ++PropPatched;
+          Changed = true;
+        }
+      }
+    }
+    if (PropPatched > 0) {
+      errs() << "[ClassNameObfuscation] Phase 3: patched " << PropPatched
+             << " property attribute strings\n";
+    }
+
     for (const auto &KV : ClassNameMap) {
       errs() << "[ClassNameObfuscation] " << KV.first << " -> " << KV.second
              << "\n";

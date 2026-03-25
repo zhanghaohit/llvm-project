@@ -3543,14 +3543,24 @@ bool llvm::canReplaceOperandWithVariable(const Instruction *I, unsigned OpIdx) {
     // prologue/epilogue insertion so they're free anyway. We definitely don't
     // want to make them non-constant.
     return !cast<AllocaInst>(I)->isStaticAlloca();
-  case Instruction::GetElementPtr:
+  case Instruction::GetElementPtr: {
     if (OpIdx == 0)
       return true;
-    gep_type_iterator It = gep_type_begin(I);
-    for (auto E = std::next(It, OpIdx); It != E; ++It)
+    // Avoid std::next(It, OpIdx) which calls getTypeAtIndex(Value*) on each
+    // step and crashes when a struct is indexed by a non-constant operand
+    // (e.g. getelementptr %S, ptr %arr, i64 %n, i32 field — valid IR, but
+    // cast<Constant>(%n) in getTypeAtIndex aborts). Walk manually, checking
+    // isStruct() before each advance so we never advance past a struct.
+    unsigned k = 1;
+    for (gep_type_iterator It = gep_type_begin(I), E = gep_type_end(I);
+         It != E && k <= OpIdx; ++k) {
       if (It.isStruct())
         return false;
+      if (k < OpIdx)
+        ++It; // safe: CurTy is sequential (array/vector), not struct
+    }
     return true;
+  }
   }
 }
 
